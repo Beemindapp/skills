@@ -20,6 +20,7 @@ python3 $T estimate -m sonnet --lines 400 --kind code --tools "bash:20 read:40 e
 python3 $T schedule plan.json --start 15:00      # multi-step plan: the script adds the steps, not you
 python3 $T done 7 12m [--out 74000]              # after the job: record reality, the bias adapts
 python3 $T review                                # past estimates against what really happened
+python3 $T learn "refactors here need two test runs, not one"   # a lesson the next planner reads
 python3 $T calibrate                             # new model or a month (35s first, 0.3s after)
 python3 $T quick                                 # regenerate QUICK.md after calibrate
 ```
@@ -159,6 +160,21 @@ In a few lines, in this order: agent time with its range, the human gates it nee
 and a clock time only if the owner's own availability is known: "~5 min of agent time once you answer two
 questions at 15:00, so done around 15:10". If a plan needs more than two hours of agent time, say what to cut
 first. A job that size should be broken into ordered steps, each with its own estimate.
+
+## The loop that makes it better
+
+The script learns numbers, and you learn the rest.
+
+- **Before sizing, read `lessons.md`** (one dated line each, at most a screen). It holds what the measurements
+  cannot say: which job types here always double, which checks are slower than the table, what the owner corrected.
+- **After a job, `done <id> <actual>`.** When the miss is worse than 0.8x to 1.25x the script writes the lesson
+  itself, with the planned tokens and the real ones, so the next planner sees the cause and not just the number.
+- **When you notice something the numbers miss, `learn "<one sentence>"`.** Put the observable in it: the job type,
+  the multiplier, what went wrong. "Long jobs here grow, 1.4x to 1.9x" is a lesson. "Be careful" is not.
+- **`review`** prints the record, the lessons and the bias in force. If an estimate is still open after two days,
+  close it or delete the row; a history full of unknowns teaches nothing.
+- `estimate` prints a `size` line when measured jobs used more tokens than planned. It is a warning about your
+  sizing, not a correction: give it a bigger `--out` or cut the scope.
 
 ## Keeping it honest
 

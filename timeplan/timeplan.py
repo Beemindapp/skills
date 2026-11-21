@@ -27,6 +27,7 @@ DATA = os.path.join(HERE, "data")
 RATES = os.path.join(DATA, "rates.json")
 CACHE = os.path.join(DATA, "files.jsonl")
 HISTORY = os.path.join(HERE, "history.tsv")
+LESSONS = os.path.join(HERE, "lessons.md")
 CLAUDE_ROOT = os.path.expanduser(os.environ.get("TIMEPLAN_CLAUDE_ROOT", "~/.claude/projects"))
 
 
@@ -701,6 +702,7 @@ def compute_bias():
             "median_pred_s": round(statistics.median(v[1] for v in vs)),
             "size_ratio": round(statistics.median(v[2] for v in vs), 2)
             if all(v[2] for v in vs) else None,
+            "size_n": sum(1 for v in vs if v[2]),
         }
 
     everything = [v for vs in by.values() for v in vs]
@@ -1132,6 +1134,35 @@ def cmd_schedule(args):
     else:
         print(f"When it is done: timeplan.py done {idx} 45m")
 
+def read_lessons(limit=None):
+    if not os.path.exists(LESSONS):
+        return []
+    lines = [l.rstrip("\n") for l in open(LESSONS) if l.strip().startswith("-")]
+    return lines[-limit:] if limit else lines
+
+
+def add_lesson(text):
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+    new = not os.path.exists(LESSONS)
+    with open(LESSONS, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        if new:
+            fh.write("# timeplan lessons\n\n"
+                     "One dated line per lesson, written by `done` when a job missed, or by `learn` when a\n"
+                     "human or an agent notices something the numbers do not say. Read this before sizing.\n\n")
+        fh.write(f"- {stamp} {text}\n")
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    return text
+
+
+def cmd_learn(args):
+    text = " ".join(args.text).strip()
+    if not text:
+        sys.exit("give one sentence, for example: learn \"refactors here need two test runs, not one\"")
+    add_lesson(text)
+    print(f"lesson recorded ({len(read_lessons())} total): {text}")
+
+
 def cmd_review(args):
     rows = read_history()
     rates = json.load(open(RATES)) if os.path.exists(RATES) else {}
@@ -1153,6 +1184,12 @@ def cmd_review(args):
         if missing:
             print()
             print(f"no actual yet: #{', #'.join(missing)}  (timeplan.py done <id> 12m)")
+    lessons = read_lessons()
+    if lessons:
+        print()
+        print(f"lessons on file: {len(lessons)}, last {min(len(lessons), 5)}:")
+        for line in lessons[-5:]:
+            print(f"  {line[2:][:110]}")
     b = (rates.get("bias") or {})
     if b.get("n"):
         print()
@@ -1193,6 +1230,19 @@ def cmd_done(args):
         rates["bias"] = compute_bias()
         with open(RATES, "w") as fh:
             json.dump(rates, fh, indent=1)
+    if not 0.8 <= actual / pred <= 1.25:
+        detail = f"#{row['id']} {row.get('model','?')}: estimated {dur(pred)} with " \
+                 f"{row.get('out_tokens','?')} planned tokens, took {dur(actual)} " \
+                 f"({actual/pred:.2f}x)"
+        if args.out and row.get("out_tokens"):
+            try:
+                detail += f", the job used {float(args.out)/float(row['out_tokens']):.2f}x the tokens planned"
+            except (ValueError, ZeroDivisionError):
+                pass
+        if args.tools:
+            detail += f", tools: {args.tools}"
+        add_lesson(detail)
+
     line = f"#{row['id']}: estimated {dur(pred)}, actual {dur(actual)} ({actual/pred:.2f}× the estimate)"
     if args.out and row.get("actual_out") and row.get("out_tokens"):
         try:
@@ -1251,6 +1301,10 @@ def main():
     sc.add_argument("--json", action="store_true")
     sc.add_argument("--note", default="")
     sc.set_defaults(fn=cmd_schedule)
+
+    lr = sub.add_parser("learn", help="record one lesson that the next planner should read")
+    lr.add_argument("text", nargs="+")
+    lr.set_defaults(fn=cmd_learn)
 
     r = sub.add_parser("review", help="past estimates against what really happened")
     r.add_argument("--model")
