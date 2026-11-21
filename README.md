@@ -9,7 +9,7 @@ Agent skills, one folder each. A skill is a `SKILL.md` an agent reads, plus what
 ## Install
 
 ```
-git clone https://github.com/AutismLLM/skills.git
+git clone https://github.com/Beemindapp/skills.git
 cd skills
 ln -s "$PWD/timeplan" ~/.claude/skills/timeplan
 ln -s "$PWD/timeplan" ~/.pi/agent/skills/timeplan

@@ -44,7 +44,7 @@ It is not a model of cost. Tokens are counted because they take time, not becaus
 Python 3.10 or newer, standard library only, no network.
 
 ```
-git clone https://github.com/AutismLLM/skills.git
+git clone https://github.com/Beemindapp/skills.git
 cd skills/timeplan
 python3 timeplan.py calibrate     # 35s first time, 0.3s after; writes data/rates.json
 python3 timeplan.py show          # the measured table
