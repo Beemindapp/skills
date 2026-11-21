@@ -70,7 +70,8 @@ The repository ships no `data/rates.json` on purpose. Rates describe one machine
 | `show [--json]` | model table, tool latencies, turn sizes, per-source counts |
 | `estimate -m <model> (--out N \| --lines N \| --turns N) [--tools "bash:6 read:20"] [--gates N] [--parallel N] [--json]` | one piece of work |
 | `schedule plan.json [--start 15:00] [--json]` | a multi-step plan, with cumulative clock times |
-| `done <id> <actual>` | record the real duration; the bias adapts |
+| `done <id> <actual> [--out N] [--tools "bash:40 read:70"]` | record the real duration and size; the bias adapts |
+| `review [--model m]` | past estimates against what really happened, and the bias in use |
 | `quick` | regenerate `QUICK.md` from `rates.json` |
 
 ## How a number is made
@@ -85,6 +86,12 @@ is the measured p10 to p90 of real turns.
 
 Checked against 900 random measured turns from both agents: 80% within 2x, 90% within 3x, median ratio 0.93.
 `tests/validate.py` replays it and prints the per-model breakdown.
+
+Real use adds a second correction. Three jobs of 18 to 53 minutes, estimated through this skill and then timed by
+the sessions that ran them, came in at 1.58x, 1.39x and 1.85x of the estimate. The cause was the work growing, not
+the rate: more files, more failed tests, more tool calls than planned. `done` records that, the median lands in a
+per-model bias clamped to 0.75x to 1.6x, and the bias is applied in full only at the size it was learned from, so a
+two-minute answer is not inflated by evidence from a fifty-minute job.
 
 ## Layout
 

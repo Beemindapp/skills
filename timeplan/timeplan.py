@@ -8,6 +8,7 @@ import math
 import os
 import random
 import statistics
+import fcntl
 import sys
 import zlib
 
@@ -622,7 +623,7 @@ def version_key(name):
     return tuple(int(x) for x in "".join(c if c.isdigit() else " " for c in name).split())
 
 COLUMNS = ["id", "when", "model", "out_tokens", "tool_calls", "requests", "gates",
-           "parallel", "pred_s", "range_s", "actual_s", "note"]
+           "parallel", "pred_s", "range_s", "actual_s", "actual_out", "actual_tools", "note"]
 
 def read_history():
     rows = []
@@ -641,6 +642,36 @@ def write_history(rows):
         for r in rows:
             fh.write("\t".join(str(r.get(k, "")) for k in COLUMNS) + "\n")
 
+def with_history(mutate):
+    mode = "r+" if os.path.exists(HISTORY) else "w+"
+    with open(HISTORY, mode) as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            fh.seek(0)
+            text = fh.read()
+            head = text.split("\n", 1)[0].rstrip("\n").split("\t") if text.strip() else []
+            rows = []
+            for line in text.split("\n")[1:]:
+                parts = line.rstrip("\n").split("\t")
+                if head and len(parts) == len(head):
+                    rows.append(dict(zip(head, parts)))
+            out = mutate(rows)
+            cols = head or COLUMNS
+            for r in rows:
+                for k in r:
+                    if k not in cols:
+                        cols.append(k)
+            fh.seek(0)
+            fh.truncate()
+            fh.write("\t".join(cols) + "\n")
+            for r in rows:
+                fh.write("\t".join(str(r.get(k, "")) for k in cols) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    return out
+
 def compute_bias():
     by = {}
     for r in read_history():
@@ -650,16 +681,36 @@ def compute_bias():
             pred, act = float(r["pred_s"]), float(r["actual_s"])
         except (KeyError, ValueError):
             continue
-        if pred > 0 and act > 0:
-            by.setdefault(r.get("model", "?"), []).append(act / pred)
+        if pred <= 0 or act <= 0:
+            continue
+        size = None
+        try:
+            if r.get("actual_out") and float(r["out_tokens"]) > 0:
+                size = float(r["actual_out"]) / float(r["out_tokens"])
+        except ValueError:
+            size = None
+        by.setdefault(r.get("model", "?"), []).append((act / pred, pred, size))
+
     def clamp(x):
-        return round(min(max(x, 0.5), 2.5), 3)
-    vals = [v for vs in by.values() for v in vs]
-    out = {"all": clamp(statistics.median(vals)) if len(vals) >= 3 else 1.0,
-           "n": len(vals), "by_model": {}}
+        return round(min(max(x, 0.75), 1.6), 3)
+
+    def entry(vs):
+        return {
+            "bias": clamp(statistics.median(v[0] for v in vs)),
+            "n": len(vs),
+            "median_pred_s": round(statistics.median(v[1] for v in vs)),
+            "size_ratio": round(statistics.median(v[2] for v in vs), 2)
+            if all(v[2] for v in vs) else None,
+        }
+
+    everything = [v for vs in by.values() for v in vs]
+    out = {"all": 1.0, "n": len(everything), "by_model": {}}
+    if len(everything) >= 3:
+        out["all"] = clamp(statistics.median(v[0] for v in everything))
+        out["median_pred_s"] = round(statistics.median(v[1] for v in everything))
     for k, vs in by.items():
         if len(vs) >= 3:
-            out["by_model"][k] = {"bias": clamp(statistics.median(vs)), "n": len(vs)}
+            out["by_model"][k] = entry(vs)
     return out
 
 def resolve_model(rates, want):
@@ -861,15 +912,22 @@ def compute(rates, model_want, out, tools, gates=0, gate_sec=5.0, parallel=1.0,
         tool_s_p90 += cnt * p90
 
     bias = rates.get("bias") or {"all": 1.0}
-    b = (bias.get("by_model", {}).get(model_name) or {}).get("bias", bias.get("all", 1.0))
-    dec = m["decode_tok_s"] * b
-    first, nxt = m["first_req_s"] * b, m["next_req_s"] * b
+    entry = (bias.get("by_model", {}) or {}).get(model_name) or {
+        "bias": bias.get("all", 1.0), "n": bias.get("n", 0),
+        "median_pred_s": bias.get("median_pred_s")}
+    b = entry.get("bias", 1.0) or 1.0
+    dec = m["decode_tok_s"]
+    first, nxt = m["first_req_s"], m["next_req_s"]
     par = max(parallel, 1.0)
 
     ov_s = first + max(n_req - 1, 0) * nxt
     gen_s = out / dec if dec else 0.0
     scale = m.get("turn_scale", 1.0)
-    base = ((ov_s + gen_s) * scale + tool_s_med) / par + gates * gate_sec
+    model_s = (ov_s + gen_s) * scale
+    raw = (model_s + tool_s_med) / par + gates * gate_sec
+    mid = entry.get("median_pred_s")
+    applied = b if not mid else 1 + (b - 1) * min(1.0, raw / mid)
+    base = (model_s * applied + tool_s_med) / par + gates * gate_sec
     low = base * min(max(m.get("spread_p10", 0.6), 0.35), 1.0)
     high = base * max(min(m.get("spread_p90", 2.0), 3.0), 1.0)
     return {
@@ -890,6 +948,11 @@ def compute(rates, model_want, out, tools, gates=0, gate_sec=5.0, parallel=1.0,
         "gate_s": gates * gate_sec,
         "gates": gates,
         "parallel": par,
+        "bias": b,
+        "bias_applied": applied,
+        "bias_n": entry.get("n", 0),
+        "bias_median_s": mid,
+        "size_ratio": entry.get("size_ratio"),
         "base_s": base,
         "low_s": low,
         "high_s": high,
@@ -917,23 +980,25 @@ def cmd_estimate(args):
     if args.pessimistic:
         base = high
 
-    idx = len(read_history()) + 1
-    rows = read_history()
-    rows.append({
-        "id": idx,
-        "when": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        "model": model_name,
-        "out_tokens": out,
-        "tool_calls": ",".join(f"{k}:{v}" for k, v in sorted(tools.items())),
-        "requests": n_req,
-        "gates": args.gates,
-        "parallel": f"{par:g}",
-        "pred_s": round(base),
-        "range_s": f"{round(low)}-{round(high)}",
-        "actual_s": "",
-        "note": args.note or "",
-    })
-    write_history(rows)
+    def add(rows):
+        idx = len(rows) + 1
+        rows.append({
+            "id": idx,
+            "when": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            "model": model_name,
+            "out_tokens": out,
+            "tool_calls": ",".join(f"{k}:{v}" for k, v in sorted(tools.items())),
+            "requests": n_req,
+            "gates": args.gates,
+            "parallel": f"{par:g}",
+            "pred_s": round(base),
+            "range_s": f"{round(low)}-{round(high)}",
+            "actual_s": "",
+            "note": args.note or "",
+        })
+        return idx
+
+    idx = with_history(add)
 
     if args.json:
         print(json.dumps({
@@ -960,6 +1025,9 @@ def cmd_estimate(args):
 
     print(f"estimate #{idx} · {model_name} · {out:,} output tokens · {n_tools} tool calls "
           f"= {n_req} requests · {par:g} agent{'s' if par > 1 else ''}")
+    if abs(e["bias_applied"] - 1) > 0.02:
+        print(f"  calib     {e['bias']:.2f}x from {e['bias_n']} finished jobs of about "
+              f"{dur(e['bias_median_s'])}; applied {e['bias_applied']:.2f}x at this size")
     print(f"  model     {dur(first)} first request + {max(n_req-1,0)} × {dur(nxt):>5s} "
           f"= {dur(ov_s):>8s}  +  {out:,} tok ÷ {dec:.0f} tok/s = {dur(gen_s):>8s}"
           f"   ({dur(ov_s+gen_s)})")
@@ -1038,16 +1106,18 @@ def cmd_schedule(args):
         print("Steps run one after another unless a step sets parallel>1. Human gates are in "
               "the per-step time, not extra.")
 
-    rows_h = read_history()
-    idx = len(rows_h) + 1
-    rows_h.append({
-        "id": idx, "when": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        "model": "schedule(" + str(len(steps)) + ")", "out_tokens": sum(r[3] for r in rows),
-        "tool_calls": "", "requests": "", "gates": "", "parallel": "",
-        "pred_s": round(total), "range_s": f"{round(total_low)}-{round(total_high)}",
-        "actual_s": "", "note": args.note or "",
-    })
-    write_history(rows_h)
+    def add(rows_h):
+        idx = len(rows_h) + 1
+        rows_h.append({
+            "id": idx, "when": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            "model": "schedule(" + str(len(steps)) + ")", "out_tokens": sum(r[3] for r in rows),
+            "tool_calls": "", "requests": "", "gates": "", "parallel": "",
+            "pred_s": round(total), "range_s": f"{round(total_low)}-{round(total_high)}",
+            "actual_s": "", "note": args.note or "",
+        })
+        return idx
+
+    idx = with_history(add)
     if args.json:
         print(json.dumps({
             "id": idx,
@@ -1062,29 +1132,75 @@ def cmd_schedule(args):
     else:
         print(f"When it is done: timeplan.py done {idx} 45m")
 
-def cmd_done(args):
+def cmd_review(args):
     rows = read_history()
-    if not rows:
-        sys.exit("no estimates recorded yet")
-    idx = args.id or len(rows)
-    if not 1 <= idx <= len(rows):
-        sys.exit(f"no estimate #{idx}")
+    rates = json.load(open(RATES)) if os.path.exists(RATES) else {}
+    done = [r for r in rows if r.get("actual_s")]
+    print(f"estimates recorded: {len(rows)}, with a real duration: {len(done)}")
+    if done:
+        print()
+        print(f"{'#':>3s} {'model':24s} {'planned':>9s} {'predicted':>10s} {'actual':>9s} {'ratio':>6s}")
+        for r in done:
+            try:
+                pred, act = float(r["pred_s"]), float(r["actual_s"])
+            except (KeyError, ValueError):
+                continue
+            if args.model and args.model not in r.get("model", ""):
+                continue
+            print(f"{r['id']:>3s} {r.get('model','')[:24]:24s} {int(float(r.get('out_tokens') or 0)):>9d} "
+                  f"{dur(pred):>10s} {dur(act):>9s} {act/pred:6.2f}")
+        missing = [r["id"] for r in rows if not r.get("actual_s")]
+        if missing:
+            print()
+            print(f"no actual yet: #{', #'.join(missing)}  (timeplan.py done <id> 12m)")
+    b = (rates.get("bias") or {})
+    if b.get("n"):
+        print()
+        print(f"bias in use: {b.get('all', 1):.2f}x from {b['n']} finished estimate(s), "
+              f"clamped to 0.75 to 1.6, applied at the size it was learned from")
+    else:
+        print()
+        print("bias: none yet, three finished estimates are needed")
+
+
+def cmd_done(args):
     actual = parse_actual(args.actual)
     if actual <= 0:
         sys.exit(f"cannot read duration {args.actual!r} (use 12m, 90s, 1h20m)")
-    row = rows[idx - 1]
-    row["actual_s"] = round(actual)
-    if args.note:
-        row["note"] = args.note
-    write_history(rows)
+
+    def mark(rows):
+        if not rows:
+            return None
+        idx = args.id or len(rows)
+        if not 1 <= idx <= len(rows):
+            return None
+        row = rows[idx - 1]
+        row["actual_s"] = round(actual)
+        if args.out:
+            row["actual_out"] = args.out
+        if args.tools:
+            row["actual_tools"] = args.tools
+        if args.note:
+            row["note"] = args.note
+        return row
+
+    row = with_history(mark)
+    if row is None:
+        sys.exit(f"no estimate #{args.id}" if args.id else "no estimates recorded yet")
     pred = float(row["pred_s"])
     if os.path.exists(RATES):
         rates = json.load(open(RATES))
         rates["bias"] = compute_bias()
         with open(RATES, "w") as fh:
             json.dump(rates, fh, indent=1)
-    print(f"#{idx}: estimated {dur(pred)}, actual {dur(actual)} "
-          f"({actual/pred:.2f}× the estimate)")
+    line = f"#{row['id']}: estimated {dur(pred)}, actual {dur(actual)} ({actual/pred:.2f}× the estimate)"
+    if args.out and row.get("actual_out") and row.get("out_tokens"):
+        try:
+            grew = float(args.out) / float(row["out_tokens"])
+            line += f", the job used {grew:.2f}× the tokens you planned"
+        except (ValueError, ZeroDivisionError):
+            pass
+    print(line)
 
 def main():
     ap = argparse.ArgumentParser(prog="timeplan", description=DESC,
@@ -1136,9 +1252,15 @@ def main():
     sc.add_argument("--note", default="")
     sc.set_defaults(fn=cmd_schedule)
 
+    r = sub.add_parser("review", help="past estimates against what really happened")
+    r.add_argument("--model")
+    r.set_defaults(fn=cmd_review)
+
     d = sub.add_parser("done", help="record the real duration of an estimate")
     d.add_argument("id", nargs="?", type=int)
     d.add_argument("actual", help="e.g. 12m, 90s, 1h20m")
+    d.add_argument("--out", type=int, help="output tokens the job really used, if you know")
+    d.add_argument("--tools", help="tool calls the job really made, e.g. \"bash:40 read:70\"")
     d.add_argument("--note", default="")
     d.set_defaults(fn=cmd_done)
 

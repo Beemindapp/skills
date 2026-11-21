@@ -18,7 +18,8 @@ python3 $T show                                  # measured table, per model and
 python3 $T estimate -m opus --out 20000 --tools "bash:6 read:20 edit:5" [--gates 2] [--parallel 1]
 python3 $T estimate -m sonnet --lines 400 --kind code --tools "bash:20 read:40 edit:30" --json
 python3 $T schedule plan.json --start 15:00      # multi-step plan: the script adds the steps, not you
-python3 $T done 7 12m                            # after the job: record reality, the bias adapts
+python3 $T done 7 12m [--out 74000]              # after the job: record reality, the bias adapts
+python3 $T review                                # past estimates against what really happened
 python3 $T calibrate                             # new model or a month (35s first, 0.3s after)
 python3 $T quick                                 # regenerate QUICK.md after calibrate
 ```
@@ -92,6 +93,16 @@ job with 10 file reads, measured: haiku 1m51, qwen 3.8 27b 2m00, sonnet 3m00, de
 number. `--parallel` divides elapsed time but not the queue, and it does not divide judgement: fast models with
 slow feedback are where delegation goes wrong.
 
+## Long jobs grow
+
+Three measured jobs of 18 to 53 minutes ran 1.4x to 1.9x longer than their first sizing, because the work grew
+under them: more files than expected, a test that failed twice. That is not the rate being wrong, so the estimator
+prints a `calib` line when it applies a measured correction, and only at the size that correction was learned from.
+
+For a job over about 15 minutes of agent time: estimate it per phase, re-estimate after discovery instead of
+padding, and when you finish give `done` the real numbers, `--out 74000` and `--tools "bash:40 read:80"`, so the
+script can tell a job that grew from a rate that was wrong.
+
 ## Multi-step plans
 
 Never add steps yourself. Arithmetic across six numbers with three ranges is where every plan goes wrong. Write
@@ -151,8 +162,9 @@ first. A job that size should be broken into ordered steps, each with its own es
 
 ## Keeping it honest
 
-- `done <id> <actual>` after every estimate that mattered. The script stores actual against predicted in
-  `history.tsv` and folds the median into `rates.json` bias, so estimates self-correct (clamped to 0.5x to 2.5x).
+- `done <id> <actual>` after every estimate that mattered, plus `--out` when the real token count is known. The
+  script stores actual against predicted in `history.tsv` and folds the median into a per-model bias, clamped to
+  0.75x to 1.6x and applied in full only at the size the evidence came from. `review` shows the record.
 - `calibrate` is incremental and needs no network. Run it when a new model appears or after a month, then `quick`.
 - Never quote a rate for a model that is not in `show`. Calibrate first, or say it is unmeasured.
 - If `rates.json` is missing, run `calibrate` before answering anything about time.
